@@ -12,6 +12,9 @@ from config import storage
 from src import yt_handler
 
 app = Flask(__name__)
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
 app.json.sort_keys = False
 
 def generate_task_id(length: int = 16) -> str:

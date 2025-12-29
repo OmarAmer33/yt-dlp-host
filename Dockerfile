@@ -10,4 +10,5 @@ RUN apt update && \
 
 COPY . .
 
-CMD ["flask", "run"]
+CMD ["sh", "-c", "flask --app src.server:app run --host 0.0.0.0 --port ${PORT:-5000}"]
+

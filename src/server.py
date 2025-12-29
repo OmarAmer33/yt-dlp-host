@@ -25,24 +25,49 @@ def download():
         return jsonify({"error": "Missing url parameter"}), 400
     
     try:
-        ydl_opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+        # Request audio-only format to get a direct URL (not HLS)
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
+            'extract_flat': False,
+        }
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+        
+        # Get the direct audio URL
+        audio_url = info.get('url')
+        
+        # If no direct URL, try to find one in formats
+        if not audio_url:
+            formats = info.get('formats', [])
+            for f in formats:
+                # Prefer m4a or mp3 audio formats with direct URLs
+                if f.get('ext') in ['m4a', 'mp3', 'webm'] and f.get('url') and 'manifest' not in f.get('url', ''):
+                    audio_url = f.get('url')
+                    break
             
-        formats = info.get('formats', [])
-        audio_url = None
-        for f in reversed(formats):
-            if f.get('acodec') != 'none':
-                audio_url = f.get('url')
-                break
+            # Fallback: any format with audio
+            if not audio_url:
+                for f in reversed(formats):
+                    if f.get('acodec') != 'none' and f.get('url') and 'manifest' not in f.get('url', ''):
+                        audio_url = f.get('url')
+                        break
+        
+        if not audio_url:
+            return jsonify({"error": "Could not find downloadable audio URL"}), 500
         
         return jsonify({
             "title": info.get("title"),
-            "downloadUrl": audio_url or info.get("url"),
-            "videoId": info.get("id")
+            "downloadUrl": audio_url,
+            "videoId": info.get("id"),
+            "ext": info.get("ext", "m4a")
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 app.json.sort_keys = False
 

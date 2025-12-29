@@ -12,9 +12,38 @@ from config import storage
 from src import yt_handler
 
 app = Flask(__name__)
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
+@app.get("/download")
+def download():
+    import yt_dlp
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "Missing url parameter"}), 400
+    
+    try:
+        ydl_opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+        formats = info.get('formats', [])
+        audio_url = None
+        for f in reversed(formats):
+            if f.get('acodec') != 'none':
+                audio_url = f.get('url')
+                break
+        
+        return jsonify({
+            "title": info.get("title"),
+            "downloadUrl": audio_url or info.get("url"),
+            "videoId": info.get("id")
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 app.json.sort_keys = False
 
 def generate_task_id(length: int = 16) -> str:

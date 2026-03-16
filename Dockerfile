@@ -10,12 +10,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Cache bust - increment to force fresh COPY of app files
+ARG CACHEBUST=1
+
 # Copy application code
 COPY . .
 
 # Expose port
-EXPOSE 5000
+EXPOSE 8080
 
 # Run the app
-CMD ["python", "-m", "src.server"]
-
+CMD ["python", "app.py"]

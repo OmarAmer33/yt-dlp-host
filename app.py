@@ -4,9 +4,10 @@ import hmac
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -30,6 +31,73 @@ USER_AGENT = (
 )
 CLOUDINARY_CHUNK_SIZE = 95 * 1024 * 1024  # 95 MB per chunk
 
+# ---------------------------------------------------------------------------
+# In-memory async job store
+# Jobs are kept for JOB_TTL_SECONDS after completion then eligible for cleanup.
+# A background thread prunes stale jobs every JOB_PRUNE_INTERVAL_SECONDS.
+# ---------------------------------------------------------------------------
+JOB_TTL_SECONDS = 3600            # 1 hour retention after completion
+JOB_PRUNE_INTERVAL_SECONDS = 300  # prune every 5 minutes
+
+_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+
+def _new_job(youtube_url: str) -> str:
+    job_id = uuid.uuid4().hex
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "status": "pending",
+            "youtube_url": youtube_url,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "result": None,
+            "error": None,
+            "error_code": None,
+        }
+    return job_id
+
+
+def _update_job(job_id: str, **kwargs) -> None:
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(kwargs)
+            _jobs[job_id]["updated_at"] = time.time()
+
+
+def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return dict(job) if job else None
+
+
+def _prune_jobs() -> None:
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with _jobs_lock:
+        stale = [
+            jid for jid, job in _jobs.items()
+            if job["status"] in ("completed", "failed") and job["updated_at"] < cutoff
+        ]
+        for jid in stale:
+            del _jobs[jid]
+
+
+def _prune_loop() -> None:
+    while True:
+        time.sleep(JOB_PRUNE_INTERVAL_SECONDS)
+        try:
+            _prune_jobs()
+        except Exception:
+            pass
+
+
+threading.Thread(target=_prune_loop, daemon=True, name="job-pruner").start()
+
+
+# ---------------------------------------------------------------------------
+# Core error type
+# ---------------------------------------------------------------------------
 
 @dataclass
 class AppError(Exception):
@@ -47,6 +115,10 @@ class AppError(Exception):
             }
         ), self.status_code
 
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
 
 def get_service_api_key() -> Optional[str]:
     return os.getenv("API_KEY") or os.getenv("YTDLP_API_KEY")
@@ -67,6 +139,10 @@ def require_bearer_auth() -> None:
     if not provided or not hmac.compare_digest(provided, expected):
         raise AppError("unauthorized", "Invalid Bearer token.", 401)
 
+
+# ---------------------------------------------------------------------------
+# Request parsing helpers
+# ---------------------------------------------------------------------------
 
 def parse_json_body() -> Dict[str, Any]:
     if request.is_json:
@@ -90,6 +166,10 @@ def get_youtube_url_from_request() -> str:
         raise AppError("bad_request", "youtube_url is required.", 400)
     return youtube_url
 
+
+# ---------------------------------------------------------------------------
+# yt-dlp helpers
+# ---------------------------------------------------------------------------
 
 def classify_ytdlp_error(message: str) -> Tuple[str, str, int]:
     text = (message or "").strip().lower()
@@ -162,8 +242,16 @@ def ensure_cookie_file() -> Path:
     if not content:
         raise AppError("cookies_missing", f"{COOKIE_ENV_VAR} decoded to an empty cookie file.", 500)
 
-    if "# Netscape HTTP Cookie File" not in content and "\tyoutube.com\t" not in content and "\t.youtube.com\t" not in content:
-        raise AppError("cookies_stale", "Decoded cookie file does not look like a valid Netscape cookie export for YouTube.", 500)
+    if (
+        "# Netscape HTTP Cookie File" not in content
+        and "\tyoutube.com\t" not in content
+        and "\t.youtube.com\t" not in content
+    ):
+        raise AppError(
+            "cookies_stale",
+            "Decoded cookie file does not look like a valid Netscape cookie export for YouTube.",
+            500,
+        )
 
     COOKIE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     COOKIE_FILE_PATH.write_text(decoded, encoding="utf-8")
@@ -175,7 +263,11 @@ def ensure_cookie_file() -> Path:
     return COOKIE_FILE_PATH
 
 
-def build_ydl_opts(download: bool, output_template: Optional[str] = None, use_proxy: bool = False) -> Dict[str, Any]:
+def build_ydl_opts(
+    download: bool,
+    output_template: Optional[str] = None,
+    use_proxy: bool = False,
+) -> Dict[str, Any]:
     cookie_file = ensure_cookie_file()
     opts: Dict[str, Any] = {
         "quiet": True,
@@ -269,7 +361,9 @@ def download_video(youtube_url: str) -> Tuple[Path, Dict[str, Any]]:
                 tmp_path = Path(tmpdir)
                 outtmpl = str(tmp_path / "%(id)s.%(ext)s")
 
-                with YoutubeDL(build_ydl_opts(download=True, output_template=outtmpl, use_proxy=use_proxy)) as ydl:
+                with YoutubeDL(
+                    build_ydl_opts(download=True, output_template=outtmpl, use_proxy=use_proxy)
+                ) as ydl:
                     info = ydl.extract_info(youtube_url, download=True)
                     if not info:
                         raise AppError("provider_error", "yt-dlp returned no download metadata.", 500)
@@ -328,6 +422,10 @@ def download_video(youtube_url: str) -> Tuple[Path, Dict[str, Any]]:
     raise AppError("provider_error", "yt-dlp failed without a classified exception.", 500)
 
 
+# ---------------------------------------------------------------------------
+# Cloudinary helpers
+# ---------------------------------------------------------------------------
+
 def require_cloudinary_config() -> Tuple[str, str, str, str]:
     cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
     api_key = os.getenv("CLOUDINARY_API_KEY")
@@ -369,7 +467,7 @@ def _build_cloudinary_result(data: Dict[str, Any], cloud_name: str) -> Dict[str,
 
 def _upload_single(
     file_path: Path, public_id_hint: str,
-    cloud_name: str, api_key: str, api_secret: str, folder: str
+    cloud_name: str, api_key: str, api_secret: str, folder: str,
 ) -> Dict[str, str]:
     timestamp = int(time.time())
     public_id = f"{folder}/{public_id_hint}"
@@ -391,13 +489,17 @@ def _upload_single(
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
     if response.status_code >= 400:
-        raise AppError("cloudinary_upload_failed", f"Cloudinary upload failed: {response.text[:500]}", 502)
+        raise AppError(
+            "cloudinary_upload_failed",
+            f"Cloudinary upload failed: {response.text[:500]}",
+            502,
+        )
     return _build_cloudinary_result(response.json(), cloud_name)
 
 
 def _upload_chunked(
     file_path: Path, public_id_hint: str,
-    cloud_name: str, api_key: str, api_secret: str, folder: str, file_size: int
+    cloud_name: str, api_key: str, api_secret: str, folder: str, file_size: int,
 ) -> Dict[str, str]:
     upload_id = uuid.uuid4().hex
     timestamp = int(time.time())
@@ -453,6 +555,57 @@ def upload_to_cloudinary(file_path: Path, public_id_hint: str) -> Dict[str, str]
     return _upload_chunked(file_path, public_id_hint, cloud_name, api_key, api_secret, folder, file_size)
 
 
+# ---------------------------------------------------------------------------
+# Async job worker
+# ---------------------------------------------------------------------------
+
+def _run_job(job_id: str, youtube_url: str) -> None:
+    """Runs in a background thread. Downloads video and uploads to Cloudinary,
+    updating job state throughout."""
+    downloaded_file = None
+    try:
+        _update_job(job_id, status="downloading")
+        downloaded_file, info = download_video(youtube_url)
+
+        title = info.get("title") or "YouTube Video"
+        video_id = info.get("id") or extract_video_id(youtube_url) or f"yt_{int(time.time())}"
+        public_id_hint = f"{video_id}-{sanitize_title(title)}"
+
+        _update_job(job_id, status="uploading")
+        uploaded = upload_to_cloudinary(downloaded_file, public_id_hint)
+
+        _update_job(
+            job_id,
+            status="completed",
+            result={
+                "provider": "yt-dlp-cloudinary-direct",
+                "title": title,
+                "video_id": video_id,
+                "cloudinary_public_id": uploaded["cloudinary_public_id"],
+                "cloudinary_url": uploaded["cloudinary_url"],
+                "reframed_url": uploaded["reframed_url"],
+                "thumbnail_url": uploaded["thumbnail_url"],
+                "format": DEFAULT_FORMAT,
+                "merge_output_format": "mp4",
+            },
+        )
+
+    except AppError as exc:
+        _update_job(job_id, status="failed", error=exc.message, error_code=exc.code)
+    except Exception as exc:
+        _update_job(job_id, status="failed", error=str(exc), error_code="internal_error")
+    finally:
+        if downloaded_file and downloaded_file.exists():
+            try:
+                downloaded_file.unlink()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------------
+
 @app.errorhandler(AppError)
 def handle_app_error(error: AppError):
     return error.to_response()
@@ -460,8 +613,17 @@ def handle_app_error(error: AppError):
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(error: Exception):
-    return jsonify({"success": False, "code": "internal_error", "error": f"internal_error: {str(error)}", "message": str(error)}), 500
+    return jsonify({
+        "success": False,
+        "code": "internal_error",
+        "error": f"internal_error: {str(error)}",
+        "message": str(error),
+    }), 500
 
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -471,21 +633,30 @@ def health():
         cookie_path = str(ensure_cookie_file())
     except AppError as exc:
         cookie_status = exc.code
-    return jsonify(
-        {
-            "success": True,
-            "status": "ok",
-            "service": "yt-dlp-uploader",
-            "auth_configured": bool(get_service_api_key()),
-            "cookie_env_present": bool(os.getenv(COOKIE_ENV_VAR, "").strip()),
-            "cookie_status": cookie_status,
-            "cookie_file": cookie_path,
-            "proxy_configured": bool(YTDLP_PROXY_URL),
-            "cloudinary_configured": all([os.getenv("CLOUDINARY_CLOUD_NAME"), os.getenv("CLOUDINARY_API_KEY"), os.getenv("CLOUDINARY_API_SECRET")]),
-            "format": DEFAULT_FORMAT,
-            "merge_output_format": "mp4",
-        }
-    )
+
+    with _jobs_lock:
+        active_jobs = sum(1 for j in _jobs.values() if j["status"] in ("pending", "downloading", "uploading"))
+        total_jobs = len(_jobs)
+
+    return jsonify({
+        "success": True,
+        "status": "ok",
+        "service": "yt-dlp-uploader",
+        "auth_configured": bool(get_service_api_key()),
+        "cookie_env_present": bool(os.getenv(COOKIE_ENV_VAR, "").strip()),
+        "cookie_status": cookie_status,
+        "cookie_file": cookie_path,
+        "proxy_configured": bool(YTDLP_PROXY_URL),
+        "cloudinary_configured": all([
+            os.getenv("CLOUDINARY_CLOUD_NAME"),
+            os.getenv("CLOUDINARY_API_KEY"),
+            os.getenv("CLOUDINARY_API_SECRET"),
+        ]),
+        "format": DEFAULT_FORMAT,
+        "merge_output_format": "mp4",
+        "active_jobs": active_jobs,
+        "total_jobs": total_jobs,
+    })
 
 
 @app.route("/get-url", methods=["GET", "POST"])
@@ -497,11 +668,21 @@ def get_url():
     video_url = get_best_direct_url(info)
     if not video_url:
         raise AppError("provider_error", "No usable direct video URL found.", 500)
-    return jsonify({"success": True, "provider": "yt-dlp", "title": info.get("title") or "YouTube Video", "video_id": info.get("id") or extract_video_id(youtube_url), "video_url": video_url, "format": DEFAULT_FORMAT, "merge_output_format": "mp4"})
+    return jsonify({
+        "success": True,
+        "provider": "yt-dlp",
+        "title": info.get("title") or "YouTube Video",
+        "video_id": info.get("id") or extract_video_id(youtube_url),
+        "video_url": video_url,
+        "format": DEFAULT_FORMAT,
+        "merge_output_format": "mp4",
+    })
 
 
 @app.post("/download-and-upload")
 def download_and_upload():
+    """Synchronous download + upload. Suitable for short videos only.
+    For long videos use /start-job + /job-status/<job_id> instead."""
     require_bearer_auth()
     youtube_url = get_youtube_url_from_request()
     validate_youtube_url(youtube_url)
@@ -512,7 +693,18 @@ def download_and_upload():
         video_id = info.get("id") or extract_video_id(youtube_url) or f"yt_{int(time.time())}"
         public_id_hint = f"{video_id}-{sanitize_title(title)}"
         uploaded = upload_to_cloudinary(downloaded_file, public_id_hint)
-        return jsonify({"success": True, "provider": "yt-dlp-cloudinary-direct", "title": title, "video_id": video_id, "cloudinary_public_id": uploaded["cloudinary_public_id"], "cloudinary_url": uploaded["cloudinary_url"], "reframed_url": uploaded["reframed_url"], "thumbnail_url": uploaded["thumbnail_url"], "format": DEFAULT_FORMAT, "merge_output_format": "mp4"})
+        return jsonify({
+            "success": True,
+            "provider": "yt-dlp-cloudinary-direct",
+            "title": title,
+            "video_id": video_id,
+            "cloudinary_public_id": uploaded["cloudinary_public_id"],
+            "cloudinary_url": uploaded["cloudinary_url"],
+            "reframed_url": uploaded["reframed_url"],
+            "thumbnail_url": uploaded["thumbnail_url"],
+            "format": DEFAULT_FORMAT,
+            "merge_output_format": "mp4",
+        })
     finally:
         if downloaded_file and downloaded_file.exists():
             try:
@@ -521,12 +713,70 @@ def download_and_upload():
                 pass
 
 
+@app.post("/start-job")
+def start_job():
+    """Async entry point. Immediately returns a job_id.
+    Poll GET /job-status/<job_id> for progress and results."""
+    require_bearer_auth()
+    youtube_url = get_youtube_url_from_request()
+    validate_youtube_url(youtube_url)
+
+    job_id = _new_job(youtube_url)
+    t = threading.Thread(
+        target=_run_job,
+        args=(job_id, youtube_url),
+        daemon=True,
+        name=f"job-{job_id[:8]}",
+    )
+    t.start()
+
+    return jsonify({
+        "success": True,
+        "job_id": job_id,
+        "status": "pending",
+    }), 202
+
+
+@app.get("/job-status/<job_id>")
+def job_status(job_id: str):
+    """Poll this endpoint after /start-job.
+    Returns status: pending | downloading | uploading | completed | failed.
+    On completed, result contains Cloudinary URLs.
+    On failed, error and error_code describe the failure."""
+    require_bearer_auth()
+    job = _get_job(job_id)
+    if not job:
+        raise AppError("not_found", f"Job {job_id} not found.", 404)
+
+    response: Dict[str, Any] = {
+        "success": True,
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+    }
+
+    if job["status"] == "completed":
+        response["result"] = job["result"]
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+        response["error_code"] = job["error_code"]
+
+    return jsonify(response)
+
+
 @app.post("/refresh-cookies")
 def refresh_cookies():
     require_bearer_auth()
     cookie_file = ensure_cookie_file()
     line_count = len(cookie_file.read_text(encoding="utf-8").splitlines())
-    return jsonify({"success": True, "message": "Cookie file refreshed from YTDLP_COOKIES_B64.", "cookie_file": str(cookie_file), "line_count": line_count, "cookie_env_var": COOKIE_ENV_VAR})
+    return jsonify({
+        "success": True,
+        "message": "Cookie file refreshed from YTDLP_COOKIES_B64.",
+        "cookie_file": str(cookie_file),
+        "line_count": line_count,
+        "cookie_env_var": COOKIE_ENV_VAR,
+    })
 
 
 @app.route("/", methods=["GET"])

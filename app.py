@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -27,6 +28,7 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
+CLOUDINARY_CHUNK_SIZE = 95 * 1024 * 1024  # 95 MB per chunk
 
 
 @dataclass
@@ -345,8 +347,30 @@ def sign_cloudinary_params(params: Dict[str, Any], api_secret: str) -> str:
     return hashlib.sha1(f"{serial}{api_secret}".encode("utf-8")).hexdigest()
 
 
-def upload_to_cloudinary(file_path: Path, public_id_hint: str) -> Dict[str, str]:
-    cloud_name, api_key, api_secret, folder = require_cloudinary_config()
+def _build_cloudinary_result(data: Dict[str, Any], cloud_name: str) -> Dict[str, str]:
+    uploaded_public_id = data["public_id"]
+    secure_url = data["secure_url"]
+    reframed_url = (
+        f"https://res.cloudinary.com/{cloud_name}/video/upload/"
+        f"c_fill,ar_9:16,g_auto,w_1080,h_1920/q_auto:good,f_mp4/"
+        f"{uploaded_public_id}.mp4"
+    )
+    thumbnail_url = (
+        f"https://res.cloudinary.com/{cloud_name}/video/upload/"
+        f"so_auto,f_jpg,q_auto,w_720/{uploaded_public_id}.jpg"
+    )
+    return {
+        "cloudinary_public_id": uploaded_public_id,
+        "cloudinary_url": secure_url,
+        "reframed_url": reframed_url,
+        "thumbnail_url": thumbnail_url,
+    }
+
+
+def _upload_single(
+    file_path: Path, public_id_hint: str,
+    cloud_name: str, api_key: str, api_secret: str, folder: str
+) -> Dict[str, str]:
     timestamp = int(time.time())
     public_id = f"{folder}/{public_id_hint}"
     sign_params = {"folder": folder, "public_id": public_id, "timestamp": timestamp}
@@ -368,24 +392,65 @@ def upload_to_cloudinary(file_path: Path, public_id_hint: str) -> Dict[str, str]
         )
     if response.status_code >= 400:
         raise AppError("cloudinary_upload_failed", f"Cloudinary upload failed: {response.text[:500]}", 502)
-    data = response.json()
-    uploaded_public_id = data["public_id"]
-    secure_url = data["secure_url"]
-    reframed_url = (
-        f"https://res.cloudinary.com/{cloud_name}/video/upload/"
-        f"c_fill,ar_9:16,g_auto,w_1080,h_1920/q_auto:good,f_mp4/"
-        f"{uploaded_public_id}.mp4"
-    )
-    thumbnail_url = (
-        f"https://res.cloudinary.com/{cloud_name}/video/upload/"
-        f"so_auto,f_jpg,q_auto,w_720/{uploaded_public_id}.jpg"
-    )
-    return {
-        "cloudinary_public_id": uploaded_public_id,
-        "cloudinary_url": secure_url,
-        "reframed_url": reframed_url,
-        "thumbnail_url": thumbnail_url,
-    }
+    return _build_cloudinary_result(response.json(), cloud_name)
+
+
+def _upload_chunked(
+    file_path: Path, public_id_hint: str,
+    cloud_name: str, api_key: str, api_secret: str, folder: str, file_size: int
+) -> Dict[str, str]:
+    upload_id = uuid.uuid4().hex
+    timestamp = int(time.time())
+    public_id = f"{folder}/{public_id_hint}"
+    sign_params = {"folder": folder, "public_id": public_id, "timestamp": timestamp}
+    signature = sign_cloudinary_params(sign_params, api_secret)
+    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload"
+
+    offset = 0
+    last_response_data = None
+    with file_path.open("rb") as handle:
+        while offset < file_size:
+            chunk = handle.read(CLOUDINARY_CHUNK_SIZE)
+            if not chunk:
+                break
+            end = offset + len(chunk) - 1
+            response = requests.post(
+                url,
+                data={
+                    "api_key": api_key,
+                    "timestamp": timestamp,
+                    "folder": folder,
+                    "public_id": public_id,
+                    "signature": signature,
+                    "resource_type": "video",
+                },
+                files={"file": ("video.mp4", chunk, "video/mp4")},
+                headers={
+                    "X-Unique-Upload-Id": upload_id,
+                    "Content-Range": f"bytes {offset}-{end}/{file_size}",
+                },
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+            if response.status_code not in (200, 201):
+                raise AppError(
+                    "cloudinary_upload_failed",
+                    f"Cloudinary chunked upload failed at offset {offset}: {response.text[:500]}",
+                    502,
+                )
+            offset += len(chunk)
+            last_response_data = response.json()
+
+    if not last_response_data:
+        raise AppError("cloudinary_upload_failed", "Chunked upload produced no response data.", 502)
+    return _build_cloudinary_result(last_response_data, cloud_name)
+
+
+def upload_to_cloudinary(file_path: Path, public_id_hint: str) -> Dict[str, str]:
+    cloud_name, api_key, api_secret, folder = require_cloudinary_config()
+    file_size = file_path.stat().st_size
+    if file_size <= CLOUDINARY_CHUNK_SIZE:
+        return _upload_single(file_path, public_id_hint, cloud_name, api_key, api_secret, folder)
+    return _upload_chunked(file_path, public_id_hint, cloud_name, api_key, api_secret, folder, file_size)
 
 
 @app.errorhandler(AppError)

@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -30,6 +30,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
 CLOUDINARY_CHUNK_SIZE = 95 * 1024 * 1024  # 95 MB per chunk
+
+# Cookie expiry tracking — populated by ensure_cookie_file()
+_cookie_expires_at: Optional[float] = None  # Unix timestamp of earliest YouTube cookie expiry
+_cookie_expires_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # In-memory async job store
@@ -228,7 +232,33 @@ def extract_video_id(youtube_url: str) -> Optional[str]:
     return None
 
 
+def _parse_earliest_cookie_expiry(cookie_content: str) -> Optional[float]:
+    """Parse Netscape cookie file and return the earliest expiry timestamp
+    among YouTube-relevant cookies. Returns None if no expiry found."""
+    earliest: Optional[float] = None
+    for line in cookie_content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain = parts[0]
+        if "youtube.com" not in domain:
+            continue
+        try:
+            expiry = float(parts[4])
+            if expiry > 0:
+                if earliest is None or expiry < earliest:
+                    earliest = expiry
+        except (ValueError, IndexError):
+            continue
+    return earliest
+
+
 def ensure_cookie_file() -> Path:
+    global _cookie_expires_at
+
     encoded = os.getenv(COOKIE_ENV_VAR, "").strip()
     if not encoded:
         raise AppError("cookies_missing", f"YouTube cookies are missing. Set {COOKIE_ENV_VAR}.", 500)
@@ -259,6 +289,10 @@ def ensure_cookie_file() -> Path:
         os.chmod(COOKIE_FILE_PATH, 0o600)
     except Exception:
         pass
+
+    # Parse and cache cookie expiry for health reporting
+    with _cookie_expires_lock:
+        _cookie_expires_at = _parse_earliest_cookie_expiry(decoded)
 
     return COOKIE_FILE_PATH
 
@@ -634,6 +668,17 @@ def health():
     except AppError as exc:
         cookie_status = exc.code
 
+    with _cookie_expires_lock:
+        expires_at = _cookie_expires_at
+
+    now = time.time()
+    cookie_days_remaining: Optional[float] = None
+    cookie_expiry_warning = False
+    if expires_at is not None:
+        seconds_remaining = expires_at - now
+        cookie_days_remaining = round(seconds_remaining / 86400, 1)
+        cookie_expiry_warning = seconds_remaining < (7 * 86400)
+
     with _jobs_lock:
         active_jobs = sum(1 for j in _jobs.values() if j["status"] in ("pending", "downloading", "uploading"))
         total_jobs = len(_jobs)
@@ -646,6 +691,9 @@ def health():
         "cookie_env_present": bool(os.getenv(COOKIE_ENV_VAR, "").strip()),
         "cookie_status": cookie_status,
         "cookie_file": cookie_path,
+        "cookie_expires_at": expires_at,
+        "cookie_days_remaining": cookie_days_remaining,
+        "cookie_expiry_warning": cookie_expiry_warning,
         "proxy_configured": bool(YTDLP_PROXY_URL),
         "cloudinary_configured": all([
             os.getenv("CLOUDINARY_CLOUD_NAME"),
@@ -741,7 +789,7 @@ def start_job():
 def job_status(job_id: str):
     """Poll this endpoint after /start-job.
     Returns status: pending | downloading | uploading | completed | failed.
-    On completed, result contains Cloudinary URLs.
+    On completed, result fields are flattened to the top level.
     On failed, error and error_code describe the failure."""
     require_bearer_auth()
     job = _get_job(job_id)
@@ -770,12 +818,23 @@ def refresh_cookies():
     require_bearer_auth()
     cookie_file = ensure_cookie_file()
     line_count = len(cookie_file.read_text(encoding="utf-8").splitlines())
+
+    with _cookie_expires_lock:
+        expires_at = _cookie_expires_at
+
+    now = time.time()
+    days_remaining: Optional[float] = None
+    if expires_at is not None:
+        days_remaining = round((expires_at - now) / 86400, 1)
+
     return jsonify({
         "success": True,
         "message": "Cookie file refreshed from YTDLP_COOKIES_B64.",
         "cookie_file": str(cookie_file),
         "line_count": line_count,
         "cookie_env_var": COOKIE_ENV_VAR,
+        "cookie_expires_at": expires_at,
+        "cookie_days_remaining": days_remaining,
     })
 
 

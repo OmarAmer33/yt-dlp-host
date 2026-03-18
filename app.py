@@ -756,8 +756,8 @@ def job_status(job_id: str):
         "updated_at": job["updated_at"],
     }
 
-    if job["status"] == "completed":
-        response["result"] = job["result"]
+    if job["status"] == "completed" and job["result"]:
+        response.update(job["result"])
     elif job["status"] == "failed":
         response["error"] = job["error"]
         response["error_code"] = job["error_code"]
